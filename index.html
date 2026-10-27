@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stuck in the Rooms</title>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
+        }
+    }
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // level
+        let level;
+
+        // smiler
+        let smilerModel = null;
+        let smilerAnimations = [];
+        const smilers = [];
+
+        const loader = new GLTFLoader();
+        const playerRaycaster = new THREE.Raycaster();
+        const smilerRaycaster = new THREE.Raycaster();
+
+        loader.load(
+            'models/level1.glb',
+
+            (gltf) => {
+                level = gltf.scene;
+
+                level.traverse((object) => {
+                    if (object.isMesh) {
+
+                        const materials = Array.isArray(object.material)
+                            ? object.material
+                            : [object.material];
+
+                        materials.forEach((material) => {
+                            material.side = THREE.DoubleSide;
+                        });
+                    }
+                });
+
+                scene.add(level);
+
+                console.log("Level loaded!", level);
+
+                // load smiler
+                const smilerLoader = new GLTFLoader();
+
+                smilerLoader.load(
+                    'models/smiler.glb',
+
+                    (gltf) => {
+                        smilerModel = gltf.scene;
+                        smilerAnimations = gltf.animations;
+
+                        console.log("Smiler loaded!");
+                        console.log("Smiler animations:", smilerAnimations);
+                    },
+
+                    undefined,
+
+                    (error) => {
+                        console.error("SMILER FAILED TO LOAD:", error);
+                    }
+                );
+            },
+
+            undefined,
+
+            (error) => {
+                console.error("LEVEL FAILED TO LOAD:", error);
+            }
+        );
+
+        // lights
+        const levelLight = new THREE.AmbientLight(0xffe0a0, 1.5);
+        scene.add(levelLight);
+
+        // flashlight
+        const flashlight = new THREE.SpotLight(0xffffff, 6, 15, Math.PI / 5, 0.6, 1);
+        scene.add(flashlight);
+        scene.add(flashlight.target);
+        flashlight.visible = false;
+
+        // player spawn
+        camera.position.set(3, 1.6, 3);
+        const controls = new PointerLockControls(camera, document.body);
+
+        document.body.addEventListener('click', () => {
+            if (!playerDead) {
+                controls.lock();
+            }
+        });
+
+        let blackout = false;
+        let flashlightOn = false;
+        let playerDead = false;
+        let activeQTE = null;
+        let playerLocked = false;
+
+        // starting state
+        levelLight.intensity = 1.5;
+        flashlight.visible = false;
+
+        // detect wasd
+        const keys = { w: false, a: false, s: false, d: false };
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+
+            // qte input listening
+            if (activeQTE) {
+
+                if (key === activeQTE.key && !e.repeat) {
+
+                    clearTimeout(activeQTE.timeout);
+
+                    activeQTE.indicator.remove();
+
+                    activeQTE.succeeded = true;
+
+                    const smiler = activeQTE.smiler;
+
+                    activeQTE = null;
+
+                    playerLocked = false;
+
+                    showMessage("DODGED!", 600);
+
+                    console.log("QTE success!");
+
+                    return;
+                }
+            }
+
+            if (key in keys) {
+                keys[key] = true;
+            }
+
+            if (key === 'f' && blackout && !e.repeat) {
+                flashlightOn = !flashlightOn;
+                flashlight.visible = flashlightOn;
+            }
+
+            //blackout debug
+            if (key === 'b' && !e.repeat) {
+                startBlackout();
+            }
+
+            if (key === 'n' && !e.repeat) {
+                endBlackout();
+            }
+
+            //smiler spawn
+            if (key === 'e' && !e.repeat) {
+                spawnSmiler(6, 0, 6);
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            if (e.key.toLowerCase() in keys) keys[e.key.toLowerCase()] = false;
+        });
+
+        // game config
+        const moveSpeed = 0.06;
+
+        const BLACKOUT_MIN_WAIT = 15000;   // 15 sec
+        const BLACKOUT_MAX_WAIT = 35000;   // 35 sec
+
+        const BLACKOUT_MIN_DURATION = 8000;  // 8 sec
+        const BLACKOUT_MAX_DURATION = 18000; // 18 sec
+
+        const FLICKER_DURATION = 1200; // total flicker time (1.2 sec)
+        const FLICKER_INTERVAL = 100;  // how fast flicker (0.1 sec)
+
+        // smiler config
+        const SMILER_SPEED = 100;
+        const LIGHT_ATTRACTION_RANGE = 900;
+        const PROXIMITY_CHASE_RANGE = 1800;
+        const ATTACK_DISTANCE = 1.2;
+
+        const SMILER_SPAWN_CHANCE = 1; // 70%
+        const MAX_SMILERS = 47980374985235;
+
+        const WANDER_SPEED = 0.8;
+        const WANDER_MIN_TIME = 2;
+        const WANDER_MAX_TIME = 5;
+
+        const SMILER_SPAWN_POINTS = [
+            new THREE.Vector3(6, 0, 6),
+            new THREE.Vector3(-8, 0, 4),
+            new THREE.Vector3(10, 0, -6),
+            new THREE.Vector3(-5, 0, -10)
+        ];
+
+        //qte timing
+        const QTE_MIN_PERCENT = 0.1;
+        const QTE_MAX_PERCENT = 0.4;
+        const QTE_RESPONSE_TIME = 700;
+
+        const QTE_KEYS = ['q', 'e', 't', 'f'];
+
+        function spawnSmilersForBlackout() {
+
+            if (smilers.length >= MAX_SMILERS)
+                return;
+
+            if (Math.random() > SMILER_SPAWN_CHANCE)
+                return;
+
+            const spawnPoint =
+                SMILER_SPAWN_POINTS[
+                    Math.floor(
+                        Math.random() *
+                        SMILER_SPAWN_POINTS.length
+                    )
+                ];
+
+            const distanceFromPlayer =
+                spawnPoint.distanceTo(camera.position);
+
+            if (distanceFromPlayer < 6) {
+                console.log("Spawn point too close to player");
+                return;
+            }
+
+            spawnSmiler(
+                spawnPoint.x,
+                spawnPoint.y,
+                spawnPoint.z
+            );
+        }
+
+        //random calc
+        function randomBetween(min, max) {
+            return Math.random() * (max - min) + min;
+        }
+
+        // flicker-er ig
+        function flickerLightsBeforeBlackout() {
+
+            let elapsed = 0;
+
+            const flickerTimer = setInterval(() => {
+
+                // random brightness each flicker
+                levelLight.intensity = Math.random() * 1.5;
+
+                elapsed += FLICKER_INTERVAL;
+
+                if (elapsed >= FLICKER_DURATION) {
+
+                    clearInterval(flickerTimer);
+
+                    startBlackout();
+                    scheduleBlackoutEnd();
+                }
+
+            }, FLICKER_INTERVAL);
+        }
+
+        // blackout scheduler
+        function scheduleNextBlackout() {
+
+            const waitTime = randomBetween(
+                BLACKOUT_MIN_WAIT,
+                BLACKOUT_MAX_WAIT
+            );
+
+            console.log(
+                "Next blackout in",
+                Math.round(waitTime / 1000),
+                "seconds"
+            );
+
+            setTimeout(() => {
+
+                // don't start another blackout if one is already happening
+                if (!blackout && !playerDead) {
+                    flickerLightsBeforeBlackout();
+                }
+
+            }, waitTime);
+        }
+
+        function scheduleBlackoutEnd() {
+
+            const duration = randomBetween(
+                BLACKOUT_MIN_DURATION,
+                BLACKOUT_MAX_DURATION
+            );
+
+            console.log(
+                "Blackout duration:",
+                Math.round(duration / 1000),
+                "seconds"
+            );
+
+            setTimeout(() => {
+
+                if (blackout && !playerDead) {
+                    endBlackout();
+
+                    // schedule the NEXT blackout
+                    scheduleNextBlackout();
+                }
+
+            }, duration);
+        }
+
+        function randomWanderDirection() {
+
+            const angle = Math.random() * Math.PI * 2;
+
+            return new THREE.Vector3(
+                Math.cos(angle),
+                0,
+                Math.sin(angle)
+            );
+        }
+
+        // raycaster
+        function wallInDirection(direction) {
+            if (!level) return false;
+
+            direction = direction.clone();
+            direction.y = 0;
+            direction.normalize();
+
+            playerRaycaster.set(camera.position, direction);
+
+            const hits = playerRaycaster.intersectObject(level, true);
+
+            return hits.length > 0 && hits[0].distance < 0.5;
+        }
+
+        function smilerWallInDirection(smiler, direction) {
+            if (!level) return false;
+
+            direction = direction.clone();
+            direction.y = 0;
+            direction.normalize();
+
+            // Direction perpendicular to movement
+            const sideways = new THREE.Vector3(
+                -direction.z,
+                0,
+                direction.x
+            );
+
+            const bodyRadius = 0.35;
+            const checkDistance = 0.7;
+
+            // Check center, left side, and right side of Smiler
+            const offsets = [
+                0,
+                -bodyRadius,
+                bodyRadius
+            ];
+
+            for (const offset of offsets) {
+
+                const origin = smiler.model.position.clone();
+
+                // Raise ray to body height
+                origin.y += 1;
+
+                // Move ray to left/right side of body
+                origin.addScaledVector(sideways, offset);
+
+                smilerRaycaster.set(origin, direction);
+
+                const hits = smilerRaycaster.intersectObject(level, true);
+
+                if (
+                    hits.length > 0 &&
+                    hits[0].distance < checkDistance
+                ) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        //smiler spawning
+        function spawnSmiler(x, y, z) {
+
+            if (!smilerModel) {
+                console.log("Smiler isn't loaded yet!");
+                return;
+            }
+
+            const smiler = SkeletonUtils.clone(smilerModel);
+
+            smiler.position.set(x, y, z);
+            scene.add(smiler);
+
+            // animation controller
+            const mixer = new THREE.AnimationMixer(smiler);
+
+            //find idle
+            const idleClip = THREE.AnimationClip.findByName(
+                smilerAnimations,
+                'idle'
+            );
+
+            //find run
+            const runClip = THREE.AnimationClip.findByName(
+                smilerAnimations,
+                'run'
+            );
+
+            //find attack
+            const attackClip = THREE.AnimationClip.findByName(
+                smilerAnimations,
+                'attack'
+            );
+
+            const idleAction = mixer.clipAction(idleClip);
+            const runAction = mixer.clipAction(runClip);
+            const attackAction = mixer.clipAction(attackClip);
+
+            // attack only plays once
+            attackAction.setLoop(THREE.LoopOnce);
+            attackAction.clampWhenFinished = true;
+
+            idleAction.play();
+
+            smilers.push({
+                model: smiler,
+                mixer: mixer,
+                idleAction: idleAction,
+                runAction: runAction,
+                attackAction: attackAction,
+
+                state: 'idle',
+
+                wanderDirection: randomWanderDirection(),
+                wanderTimer: randomBetween(
+                    WANDER_MIN_TIME,
+                    WANDER_MAX_TIME
+                )
+            });
+        }
+
+        function showMessage(text, duration = 1000) {
+
+            const message = document.createElement('div');
+
+            message.textContent = text;
+
+            message.style.position = 'fixed';
+            message.style.top = '20%';
+            message.style.left = '50%';
+            message.style.transform = 'translate(-50%, -50%)';
+            message.style.color = 'white';
+            message.style.fontSize = '40px';
+            message.style.fontFamily = 'sans-serif';
+            message.style.fontWeight = 'bold';
+            message.style.zIndex = '9999';
+            message.style.pointerEvents = 'none';
+
+            document.body.appendChild(message);
+
+            setTimeout(() => {
+                message.remove();
+            }, duration);
+        }
+
+        function killPlayer() {
+
+            if (playerDead) return;
+
+            playerDead = true;
+
+            flashlightOn = false;
+            flashlight.visible = false;
+
+            keys.w = false;
+            keys.a = false;
+            keys.s = false;
+            keys.d = false;
+
+            controls.unlock();
+
+            const deathScreen = document.createElement('div');
+
+            deathScreen.style.position = 'fixed';
+            deathScreen.style.inset = '0';
+            deathScreen.style.background = 'black';
+            deathScreen.style.color = 'red';
+            deathScreen.style.display = 'flex';
+            deathScreen.style.alignItems = 'center';
+            deathScreen.style.justifyContent = 'center';
+            deathScreen.style.fontSize = '60px';
+            deathScreen.style.fontFamily = 'sans-serif';
+            deathScreen.style.zIndex = '9999';
+
+            deathScreen.textContent = 'YOU DIED';
+
+            document.body.appendChild(deathScreen);
+        }
+
+        function startQTE(smiler) {
+
+            // don't start another QTE
+            if (activeQTE || playerDead) return;
+
+            const randomKey =
+                QTE_KEYS[Math.floor(Math.random() * QTE_KEYS.length)];
+
+            const indicator = document.createElement('div');
+
+            indicator.textContent = `PRESS ${randomKey.toUpperCase()}!`;
+
+            indicator.style.position = 'fixed';
+            indicator.style.top = '35%';
+            indicator.style.left = '50%';
+            indicator.style.transform = 'translate(-50%, -50%)';
+
+            indicator.style.color = 'red';
+            indicator.style.fontSize = '55px';
+            indicator.style.fontWeight = 'bold';
+            indicator.style.fontFamily = 'sans-serif';
+
+            indicator.style.zIndex = '9999';
+            indicator.style.pointerEvents = 'none';
+
+            document.body.appendChild(indicator);
+
+            activeQTE = {
+                key: randomKey,
+                smiler: smiler,
+                indicator: indicator,
+                succeeded: false
+            };
+
+            // player failed to press the key in time
+            activeQTE.timeout = setTimeout(() => {
+
+                if (!activeQTE) return;
+
+                activeQTE.indicator.remove();
+                activeQTE = null;
+
+                showMessage("MISSED!", 500);
+
+                killPlayer();
+
+            }, QTE_RESPONSE_TIME);
+        }
+
+        //attack
+        function attackPlayer(smiler) {
+
+            if (
+                playerDead ||
+                smiler.state === 'attacking'
+            ) return;
+
+            smiler.state = 'attacking';
+            playerLocked = true;
+
+            keys.w = false;
+            keys.a = false;
+            keys.s = false;
+            keys.d = false;
+
+            // stop previous animations
+            smiler.runAction.fadeOut(0.15);
+            smiler.idleAction.fadeOut(0.15);
+
+            // play attack
+            smiler.attackAction
+                .reset()
+                .fadeIn(0.15)
+                .play();
+
+            console.log("Smiler attacking!");
+
+            const attackDuration =
+                smiler.attackAction.getClip().duration;
+
+            // choose a random moment during the attack
+            const randomPercent =
+                QTE_MIN_PERCENT +
+                Math.random() *
+                (QTE_MAX_PERCENT - QTE_MIN_PERCENT);
+
+            const qteTime =
+                attackDuration * randomPercent;
+
+            // show the button prompt at that moment
+            setTimeout(() => {
+
+                if (
+                    !playerDead &&
+                    smiler.state === 'attacking'
+                ) {
+                    startQTE(smiler);
+                }
+
+            }, qteTime * 1000);
+
+            // attack animation finished
+            const onAttackFinished = (event) => {
+
+                if (event.action !== smiler.attackAction)
+                    return;
+
+                smiler.mixer.removeEventListener(
+                    'finished',
+                    onAttackFinished
+                );
+
+                if (!playerDead) {
+
+                    smiler.attackAction.fadeOut(0.1);
+
+                    smiler.runAction
+                        .reset()
+                        .fadeIn(0.1)
+                        .play();
+
+                    smiler.state = 'running';
+                }
+            };
+
+            smiler.mixer.addEventListener(
+                'finished',
+                onAttackFinished
+            );
+        }
+
+        //blackout
+        function startBlackout() {
+            blackout = true;
+
+            levelLight.intensity = 0.02;
+
+            flashlightOn = false;
+            flashlight.visible = false;
+
+            spawnSmilersForBlackout();
+
+            console.log("blackout");
+        }
+
+        function endBlackout() {
+            blackout = false;
+
+            levelLight.intensity = 1.5;
+
+            flashlightOn = false;
+            flashlight.visible = false;
+
+            console.log("Power restored");
+        }
+
+        function updateSmilers(delta) {
+
+            smilers.forEach((smiler) => {
+
+                smiler.mixer.update(delta);
+
+                const direction = new THREE.Vector3()
+                    .subVectors(camera.position, smiler.model.position);
+
+                direction.y = 0;
+
+                const distance = direction.length();
+
+                //attack if close enough
+                if (
+                    distance < ATTACK_DISTANCE &&
+                    smiler.state !== 'attacking'
+                ) {
+                    attackPlayer(smiler);
+                }
+
+                //stop chasing
+                if (smiler.state === 'attacking') {
+                    return;
+                }
+
+                // dectect conditions
+                // 1. it is a blackout
+                //  2. flashlight is on
+                //  3. player is close enough
+                const attractedByLight =
+                    blackout &&
+                    flashlightOn &&
+                    distance < LIGHT_ATTRACTION_RANGE;
+
+                const tooClose =
+                    distance < PROXIMITY_CHASE_RANGE;
+
+                const shouldChase =
+                    attractedByLight || tooClose;
+
+                if (shouldChase) {
+
+                    // switch to running
+                    if (smiler.state !== 'running') {
+
+                        smiler.idleAction.fadeOut(0.2);
+
+                        smiler.runAction
+                            .reset()
+                            .fadeIn(0.2)
+                            .play();
+
+                        smiler.runAction.timeScale = 1;
+                        smiler.state = 'running';
+                    }
+
+                    direction.normalize();
+
+                    smiler.model.lookAt(
+                        camera.position.x,
+                        smiler.model.position.y,
+                        camera.position.z
+                    );
+
+                    if (distance > 1) {
+
+                        let moveDirection = direction.clone();
+
+                        if (smilerWallInDirection(smiler, moveDirection)) {
+
+                            const leftDirection = direction.clone()
+                                .applyAxisAngle(
+                                    new THREE.Vector3(0, 1, 0),
+                                    Math.PI / 4
+                                );
+
+                            const rightDirection = direction.clone()
+                                .applyAxisAngle(
+                                    new THREE.Vector3(0, 1, 0),
+                                    -Math.PI / 4
+                                );
+
+                            if (!smilerWallInDirection(smiler, leftDirection)) {
+                                moveDirection = leftDirection;
+                            }
+
+                            else if (!smilerWallInDirection(smiler, rightDirection)) {
+                                moveDirection = rightDirection;
+                            }
+
+                            else {
+                                moveDirection = null;
+                            }
+                        }
+
+                        if (moveDirection) {
+                            smiler.model.position.addScaledVector(
+                                moveDirection,
+                                SMILER_SPEED * delta
+                            );
+                        }
+                    }
+
+                } else {
+
+                    // WANDERING
+                    if (smiler.state !== 'wandering') {
+
+                        smiler.idleAction.fadeOut(0.2);
+
+                        smiler.runAction
+                            .reset()
+                            .fadeIn(0.2)
+                            .play();
+
+                        smiler.runAction.timeScale = 0.45;
+
+                        smiler.state = 'wandering';
+                    }
+
+                    smiler.wanderTimer -= delta;
+
+                    if (smiler.wanderTimer <= 0) {
+
+                        smiler.wanderDirection =
+                            randomWanderDirection();
+
+                        smiler.wanderTimer =
+                            randomBetween(
+                                WANDER_MIN_TIME,
+                                WANDER_MAX_TIME
+                            );
+                    }
+
+                    if (
+                        smilerWallInDirection(
+                            smiler,
+                            smiler.wanderDirection
+                        )
+                    ) {
+
+                        smiler.wanderDirection =
+                            randomWanderDirection();
+
+                        smiler.wanderTimer =
+                            randomBetween(
+                                WANDER_MIN_TIME,
+                                WANDER_MAX_TIME
+                            );
+
+                    } else {
+
+                        const lookTarget =
+                            smiler.model.position.clone()
+                                .add(smiler.wanderDirection);
+
+                        smiler.model.lookAt(
+                            lookTarget.x,
+                            smiler.model.position.y,
+                            lookTarget.z
+                        );
+
+                        smiler.model.position.addScaledVector(
+                            smiler.wanderDirection,
+                            WANDER_SPEED * delta
+                        );
+                    }
+                }
+            });
+        }
+
+        const clock = new THREE.Clock();
+
+        // animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+
+            //clock
+            const delta = clock.getDelta();
+
+            updateSmilers(delta);
+
+            // figure out which way the player is facing
+            const forward = new THREE.Vector3();
+            camera.getWorldDirection(forward);
+
+            forward.y = 0;
+            forward.normalize();
+
+            const backward = forward.clone().negate();
+
+            const right = new THREE.Vector3(
+                -forward.z,
+                0,
+                forward.x
+            );
+
+            const left = right.clone().negate();
+
+            // movement
+            if (!playerDead && !playerLocked) {
+
+                if (keys.w && !wallInDirection(forward))
+                    controls.moveForward(moveSpeed);
+
+                if (keys.s && !wallInDirection(backward))
+                    controls.moveForward(-moveSpeed);
+
+                if (keys.a && !wallInDirection(left))
+                    controls.moveRight(-moveSpeed);
+
+                if (keys.d && !wallInDirection(right))
+                    controls.moveRight(moveSpeed);
+            }
+
+            // flashlight updating
+            flashlight.position.copy(camera.position);
+
+            const direction = new THREE.Vector3();
+            camera.getWorldDirection(direction);
+
+            flashlight.target.position.copy(camera.position)
+                .add(direction);
+
+            flashlight.target.updateMatrixWorld();
+
+            renderer.render(scene, camera);
+        }
+
+        // window resizing stuff
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+        scheduleNextBlackout();
+    </script>
+</body>
+</html>
